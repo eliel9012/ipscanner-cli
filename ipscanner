@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""
+ipscanner — Colorful LAN device scanner with manufacturer + Bonjour info.
+Uses arp-scan for L2 discovery, avahi-browse for Bonjour/mDNS, and a local
+IEEE OUI database for more reliable manufacturer detection.
+"""
+
+import argparse
+import json
+import re
+import socket
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── ANSI colors ──────────────────────────────────────────────────────────────
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+CYAN = "\033[96m"
+WHITE = "\033[97m"
+
+VERSION = "0.9.1"
+DATA_DIR = Path.home() / ".local" / "share" / "ipscanner"
+DB_PATH = DATA_DIR / "vendors.json"
+DB_STALE_DAYS = 45
+
+# Friendly device-type guessing based on vendor + services
+DEVICE_ICONS = {
+    "apple": "🍎",
+    "raspberry": "🍓",
+    "amazon": "📦",
+    "google": "🔍",
+    "samsung": "📱",
+    "huawei": "📡",
+    "intelbras": "📹",
+    "arcadyan": "📶",
+    "espressif": "⚡",
+    "tp-link": "📶",
+    "intel": "💻",
+    "dell": "🖥️",
+    "lenovo": "💻",
+    "microsoft": "🪟",
+    "sonos": "🔊",
+    "roku": "📺",
+    "lg": "📺",
+    "sony": "🎮",
+    "nvidia": "🎮",
+    "philips": "💡",
+    "nest": "🏠",
+    "ring": "🔔",
+    "wyze": "📹",
+    "ubiquiti": "📡",
+    "netgear": "📶",
+}
+
+SERVICE_FRIENDLY = {
+    "_http._tcp": "🌐 HTTP",
+    "_https._tcp": "🔒 HTTPS",
+    "_smb._tcp": "📁 SMB",
+    "_afpovertcp._tcp": "📁 AFP",
+    "_ssh._tcp": "🔑 SSH",
+    "_sftp-ssh._tcp": "🔑 SFTP",
+    "_airplay._tcp": "📺 AirPlay",
+    "_raop._tcp": "🎵 AirPlay Audio",
+    "_googlecast._tcp": "📺 Chromecast",
+    "_spotify-connect._tcp": "🎵 Spotify",
+    "_printer._tcp": "🖨️  Printer",
+    "_ipp._tcp": "🖨️  IPP Print",
+    "_scanner._tcp": "📄 Scanner",
+    "_device-info._tcp": "ℹ️  Device Info",
+    "_companion-link._tcp": "📱 Apple Companion",
+    "_homekit._tcp": "🏠 HomeKit",
+    "_hap._tcp": "🏠 HomeKit",
+    "_sleep-proxy._udp": "😴 Sleep Proxy",
+    "_touch-able._tcp": "📱 Apple Remote",
+    "_rdlink._tcp": "🔗 Remote Desktop",
+    "_nfs._tcp": "📁 NFS",
+    "_ftp._tcp": "📁 FTP",
+    "_daap._tcp": "🎵 iTunes/DAAP",
+    "_dpap._tcp": "📷 iPhoto/DPAP",
+    "_pulse-server._tcp": "🔊 PulseAudio",
+    "_mqtt._tcp": "📡 MQTT",
+    "_coap._udp": "📡 CoAP",
+    "_workstation._tcp": "💻 Workstation",
+    "_net-assistant._udp": "🔧 Net Assistant",
+    "_udisks-ssh._tcp": "💾 Disk (SSH)",
+    "_webdav._tcp": "📁 WebDAV",
+    "_mediaremotetv._tcp": "📺 Apple TV Remote",
+    "_airplay2._tcp": "📺 AirPlay 2",
+    "_matter._tcp": "🏠 Matter",
+    "_esphomelib._tcp": "⚡ ESPHome",
+    "Microsoft Windows Network": "📁 SMB/CIFS",
+    "Web Site": "🌐 Web",
+    "Device Info": "ℹ️  Device Info",
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--db-info", action="store_true", help="show local vendor DB info and exit")
+    parser.add_argument("--version", action="store_true", help="show version and exit")
+    parser.add_argument("-h", "--help", action="help", help="show this help message and exit")
+    return parser.parse_args()
+
+
+def normalize_mac(mac):
+    return re.sub(r"[^0-9A-Fa-f]", "", mac or "").upper()
+
+
+def is_unknown_vendor(vendor):
+    if not vendor:
+        return True
+    text = vendor.strip().lower()
+    return text in {"?", "n/a", "private"} or "unknown" in text
+
+
+def is_locally_administered_mac(mac):
+    normalized = normalize_mac(mac)
+    if len(normalized) < 2:
+        return False
+    return bool(int(normalized[:2], 16) & 0x02)
+
+
+def load_vendor_db():
+    if not DB_PATH.exists():
+        return None
+
+    try:
+        data = json.loads(DB_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    prefixes = data.get("prefixes", {})
+    return {
+        "generated_at": data.get("generated_at"),
+        "source_name": data.get("source_name", "IEEE Registration Authority"),
+        "sources": data.get("sources", []),
+        "counts": data.get("counts", {}),
+        "prefixes": {
+            9: prefixes.get("9", {}),
+            7: prefixes.get("7", {}),
+            6: prefixes.get("6", {}),
+        },
+    }
+
+
+def lookup_vendor(mac, vendor_db):
+    if not vendor_db:
+        return None
+
+    normalized = normalize_mac(mac)
+    if len(normalized) < 12:
+        return None
+
+    for prefix_len in (9, 7, 6):
+        vendor = vendor_db["prefixes"][prefix_len].get(normalized[:prefix_len])
+        if vendor:
+            return vendor
+    return None
+
+
+def guess_vendor_from_context(hostname, services_list):
+    haystack = " ".join(
+        filter(
+            None,
+            [hostname]
+            + [item for service in services_list for item in service[:3]],
+        )
+    ).lower()
+
+    apple_markers = [
+        "macbook",
+        "mac mini",
+        "mac-mini",
+        "iphone",
+        "ipad",
+        "imac",
+        "airplay",
+        "raop",
+        "companion-link",
+        "apple-mobdev",
+        "remotepairing",
+    ]
+    if any(marker in haystack for marker in apple_markers):
+        return "Apple (provável, MAC privado)"
+
+    google_markers = ["googlecast", "chromecast", "nest"]
+    if any(marker in haystack for marker in google_markers):
+        return "Google (provável, MAC privado)"
+
+    amazon_markers = ["amazon fire tv", "fire tv", "alexa", "echo"]
+    if any(marker in haystack for marker in amazon_markers):
+        return "Amazon (provável, MAC privado)"
+
+    return None
+
+
+def resolve_vendor(mac, arp_vendor, vendor_db, hostname, services_list):
+    db_vendor = lookup_vendor(mac, vendor_db)
+    if db_vendor and db_vendor.strip().lower() != "private":
+        return db_vendor
+    if arp_vendor and not is_unknown_vendor(arp_vendor):
+        return arp_vendor.strip()
+    if is_locally_administered_mac(mac):
+        guessed_vendor = guess_vendor_from_context(hostname, services_list)
+        if guessed_vendor:
+            return guessed_vendor
+    if db_vendor:
+        return db_vendor
+    return arp_vendor.strip() if arp_vendor else "Unknown"
+
+
+def vendor_db_status(vendor_db):
+    if not vendor_db:
+        return "Fabricantes: fallback do arp-scan (sem base IEEE local)"
+
+    generated_at = vendor_db.get("generated_at")
+    if not generated_at:
+        return "Fabricantes: IEEE local"
+
+    try:
+        dt = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+        age_days = (datetime.now(timezone.utc) - dt).days
+    except ValueError:
+        return "Fabricantes: IEEE local"
+
+    if age_days > DB_STALE_DAYS:
+        return f"Fabricantes: IEEE local ({age_days} dias, rode ipscanner-update-db)"
+    return f"Fabricantes: IEEE local ({age_days} dias)"
+
+
+def print_db_info(vendor_db):
+    print(f"DB path: {DB_PATH}")
+    if not vendor_db:
+        print("Status: ausente")
+        print("Ação: rode ipscanner-update-db")
+        return
+
+    print(f"Status: presente")
+    print(f"Fonte: {vendor_db.get('source_name', 'IEEE Registration Authority')}")
+    print(f"Gerado em: {vendor_db.get('generated_at', '?')}")
+    counts = vendor_db.get("counts", {})
+    print(
+        "Entradas: "
+        f"MA-L={counts.get('6', 0)} "
+        f"MA-M={counts.get('7', 0)} "
+        f"MA-S={counts.get('9', 0)}"
+    )
+    print(vendor_db_status(vendor_db))
+
+
+def get_interface():
+    """Detect the main LAN interface from default route."""
+    try:
+        out = subprocess.check_output(
+            ["ip", "route", "show", "default"], text=True
+        )
+        for line in out.splitlines():
+            match = re.search(r"dev\s+(\S+)", line)
+            if match and not match.group(1).startswith(("docker", "br-", "veth", "nord", "tun", "wg")):
+                return match.group(1)
+    except Exception:
+        pass
+    return "eth0"
+
+
+def run_arp_scan(iface):
+    """Run arp-scan and return list of (ip, mac, vendor)."""
+    devices = []
+    seen = set()
+    try:
+        out = subprocess.check_output(
+            ["sudo", "arp-scan", "--localnet", f"--interface={iface}", "--retry=2"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+        for line in out.splitlines():
+            match = re.match(
+                r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:]{17})\s+(.*)",
+                line.strip(),
+            )
+            if match:
+                ip = match.group(1)
+                mac = match.group(2).lower()
+                vendor = match.group(3).strip()
+                key = (ip, mac)
+                if key not in seen:
+                    seen.add(key)
+                    devices.append((ip, mac, vendor))
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        print(f"{RED}Erro ao executar arp-scan: {exc}{RESET}", file=sys.stderr)
+    return devices
+
+
+def run_avahi_browse():
+    """Run avahi-browse and return dict: ip -> list of (service_name, service_type, hostname, port)."""
+    services = defaultdict(list)
+    try:
+        raw = subprocess.check_output(
+            ["avahi-browse", "-atrpc"],
+            stderr=subprocess.DEVNULL,
+            timeout=12,
+        )
+        out = raw.decode("utf-8", errors="replace")
+        for line in out.splitlines():
+            if not line.startswith("="):
+                continue
+            parts = line.split(";")
+            if len(parts) < 8:
+                continue
+            iface_name = parts[1]
+            if iface_name.startswith(("veth", "docker", "br-")):
+                continue
+            svc_name = parts[3].replace("\\032", " ").replace("\\046", "&")
+            svc_type = parts[4]
+            hostname = parts[6]
+            ip = parts[7]
+            port = parts[8] if len(parts) > 8 else ""
+            if ip.startswith("fe80:") or ip.startswith("::"):
+                continue
+            services[ip].append((svc_name, svc_type, hostname, port))
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return services
+
+
+def resolve_hostname(ip):
+    """Try reverse DNS lookup."""
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except (socket.herror, socket.gaierror, OSError):
+        return None
+
+
+def get_device_icon(vendor, services_list):
+    """Pick an emoji icon based on vendor name or services."""
+    vendor_lower = vendor.lower()
+    for key, icon in DEVICE_ICONS.items():
+        if key in vendor_lower:
+            return icon
+    if services_list:
+        svc_types = " ".join(svc[1].lower() for svc in services_list)
+        if "airplay" in svc_types or "companion" in svc_types:
+            return "🍎"
+        if "googlecast" in svc_types:
+            return "📺"
+        if "homekit" in svc_types or "hap" in svc_types:
+            return "🏠"
+        if "printer" in svc_types or "ipp" in svc_types:
+            return "🖨️"
+    return "🔌"
+
+
+def friendly_service(svc_type):
+    """Convert service type to a friendly label."""
+    svc_key = svc_type.strip().rstrip(".")
+    if svc_key in SERVICE_FRIENDLY:
+        return SERVICE_FRIENDLY[svc_key]
+    clean = svc_key.replace("_", "").replace("._tcp", "").replace("._udp", "")
+    return f"🔹 {clean}"
+
+
+def print_header():
+    print()
+    print(f"  {BOLD}{CYAN}╔══════════════════════════════════════════════════════════════════╗{RESET}")
+    print(f"  {BOLD}{CYAN}║{RESET}  {BOLD}{WHITE}📡  IP Scanner — Dispositivos na Rede Local{RESET}                    {BOLD}{CYAN}║{RESET}")
+    print(f"  {BOLD}{CYAN}╚══════════════════════════════════════════════════════════════════╝{RESET}")
+    print()
+
+
+def print_device(ip, mac, vendor, hostname, services_list, is_self):
+    icon = get_device_icon(vendor, services_list)
+
+    if is_self:
+        label = f"{GREEN}{BOLD}★ ESTE DISPOSITIVO{RESET}"
+    elif "unknown" in vendor.lower():
+        label = f"{DIM}{vendor}{RESET}"
+    else:
+        label = f"{YELLOW}{vendor}{RESET}"
+
+    print(f"  {CYAN}{'─' * 66}{RESET}")
+    print(f"  {icon}  {BOLD}{WHITE}{ip:<18}{RESET} {label}")
+    print(f"      {DIM}MAC:{RESET} {MAGENTA}{mac}{RESET}", end="")
+
+    if hostname:
+        print(f"   {DIM}DNS:{RESET} {BLUE}{hostname}{RESET}")
+    else:
+        print()
+
+    if services_list:
+        seen = set()
+        unique_svcs = []
+        for svc_name, svc_type, svc_host, svc_port in services_list:
+            key = (svc_type, svc_port)
+            if key not in seen:
+                seen.add(key)
+                unique_svcs.append((svc_name, svc_type, svc_host, svc_port))
+
+        bonjour_name = services_list[0][2]
+        if bonjour_name and bonjour_name != hostname:
+            print(f"      {DIM}mDNS:{RESET} {GREEN}{bonjour_name}{RESET}")
+
+        svc_labels = []
+        for svc_name, svc_type, svc_host, svc_port in unique_svcs:
+            friendly = friendly_service(svc_type)
+            if svc_port and svc_port != "0":
+                friendly += f"{DIM}:{svc_port}{RESET}"
+            svc_labels.append(friendly)
+
+        if svc_labels:
+            print(f"      {DIM}Serviços:{RESET} {', '.join(svc_labels)}")
+
+
+def main():
+    args = parse_args()
+    vendor_db = load_vendor_db()
+
+    if args.db_info:
+        print_db_info(vendor_db)
+        return
+    if args.version:
+        print(VERSION)
+        return
+
+    print_header()
+
+    iface = get_interface()
+    my_ip = None
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "addr", "show", iface], text=True
+        )
+        match = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", out)
+        if match:
+            my_ip = match.group(1)
+    except Exception:
+        pass
+
+    print(f"  {DIM}Interface: {iface}  |  Meu IP: {my_ip or '?'}{RESET}")
+    print(f"  {DIM}{vendor_db_status(vendor_db)}{RESET}")
+    print(f"  {DIM}Escaneando...{RESET}", end="", flush=True)
+
+    devices = run_arp_scan(iface)
+
+    if my_ip:
+        found_ips = {device[0] for device in devices}
+        if my_ip not in found_ips:
+            my_mac = "??:??:??:??:??:??"
+            try:
+                mac_out = subprocess.check_output(
+                    ["ip", "link", "show", iface], text=True
+                )
+                match = re.search(r"link/ether\s+([0-9a-fA-F:]{17})", mac_out)
+                if match:
+                    my_mac = match.group(1).lower()
+            except Exception:
+                pass
+            devices.append((my_ip, my_mac, "Este dispositivo"))
+
+    print(f"\r  {DIM}Buscando serviços Bonjour/mDNS...{RESET}  ", end="", flush=True)
+    avahi_services = run_avahi_browse()
+
+    print(f"\r  {GREEN}{BOLD}{len(devices)}{RESET}{DIM} dispositivos encontrados{RESET}          ")
+
+    def sort_key(device):
+        ip = device[0]
+        parts = list(map(int, ip.split(".")))
+        if parts[-1] == 1:
+            return (0,) + tuple(parts)
+        if ip == my_ip:
+            return (1,) + tuple(parts)
+        return (2,) + tuple(parts)
+
+    devices.sort(key=sort_key)
+
+    resolved_devices = []
+    for ip, mac, arp_vendor in devices:
+        hostname = resolve_hostname(ip)
+        services = avahi_services.get(ip, [])
+        vendor = resolve_vendor(mac, arp_vendor, vendor_db, hostname, services)
+        is_self = ip == my_ip
+        print_device(ip, mac, vendor, hostname, services, is_self)
+        resolved_devices.append((ip, mac, vendor))
+
+    print(f"  {CYAN}{'─' * 66}{RESET}")
+    print()
+
+    vendors = defaultdict(int)
+    for _, _, vendor in resolved_devices:
+        key = vendor if "unknown" not in vendor.lower() else "Desconhecido"
+        vendors[key] += 1
+
+    if vendors:
+        print(f"  {BOLD}Resumo por fabricante:{RESET}")
+        for vendor, count in sorted(vendors.items(), key=lambda item: (-item[1], item[0].lower())):
+            bar = f"{CYAN}{'█' * count}{RESET}"
+            print(f"    {bar} {vendor} ({count})")
+        print()
+
+
+if __name__ == "__main__":
+    main()
