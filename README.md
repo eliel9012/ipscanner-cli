@@ -1,6 +1,6 @@
-# ipscanner
+# IP Scanner CLI
 
-`ipscanner` is a small LAN scanner for people who want useful answers quickly: who is on the network, what each device probably is, and which manufacturer is behind the MAC address.
+`ipscanner` is the command behind IP Scanner CLI: a small LAN scanner for people who want useful answers quickly, such as who is on the network, what each device probably is, and which manufacturer is behind the MAC address.
 
 It keeps the fast, practical side of `arp-scan` and `avahi-browse`, but adds a local vendor database built from the official IEEE registries. That makes manufacturer names much more consistent than relying on whatever happens to come back from a single scan.
 
@@ -12,20 +12,20 @@ Source for vendor data:
 - MA-M: https://standards-oui.ieee.org/oui28/mam.csv
 - MA-S: https://standards-oui.ieee.org/oui36/oui36.csv
 
-## Portugues
+## Português
 
 ### O que ele faz
 
-O `ipscanner` foi feito para ser simples de usar e agradavel de ler no terminal. Ele mostra os dispositivos da sua LAN com IP, MAC, fabricante, nome mDNS/DNS quando existir e alguns servicos descobertos via Bonjour.
+O `ipscanner` foi feito para ser simples de usar e agradável de ler no terminal. Ele mostra os dispositivos da sua LAN com IP, MAC, fabricante, nome mDNS/DNS quando existir e alguns serviços descobertos via Bonjour.
 
-Em vez de depender apenas do texto devolvido pelo `arp-scan`, ele consulta uma base local da IEEE. Na pratica, isso melhora bastante a qualidade do campo de fabricante. Para MACs privados e aleatorios, que sao comuns em aparelhos modernos, ele tenta ser honesto: se nao der para ter certeza, ele marca como "provavel" em vez de fingir precisao.
+Em vez de depender apenas do texto devolvido pelo `arp-scan`, ele consulta uma base local da IEEE. Na prática, isso melhora bastante a qualidade do campo de fabricante. Para MACs privados e aleatórios, que são comuns em aparelhos modernos, ele tenta ser honesto: se não der para ter certeza, ele marca como "provável" em vez de fingir precisão.
 
 ### Requisitos
 
 - Python 3
 - `arp-scan`
 - `avahi-browse`
-- permissao para executar `sudo arp-scan`
+- permissão para executar `sudo arp-scan`
 
 No Debian ou Ubuntu:
 
@@ -34,7 +34,7 @@ sudo apt update
 sudo apt install -y python3 arp-scan avahi-utils
 ```
 
-### Uso rapido
+### Uso rápido
 
 ```bash
 chmod +x ipscanner ipscanner-update-db
@@ -42,13 +42,13 @@ chmod +x ipscanner ipscanner-update-db
 ./ipscanner
 ```
 
-Ver a versao:
+Ver a versão:
 
 ```bash
 ./ipscanner --version
 ```
 
-Ver informacoes da base local:
+Ver informações da base local:
 
 ```bash
 ./ipscanner --db-info
@@ -64,8 +64,8 @@ Atualizar a base de fabricantes:
 
 - lookup local de fabricantes com base oficial da IEEE
 - suporte a MA-L, MA-M e MA-S
-- deduplicacao de entradas repetidas do `arp-scan`
-- heuristica cautelosa para MAC privado aleatorio
+- deduplicação de entradas repetidas do `arp-scan`
+- heurística cautelosa para MAC privado aleatório
 - comando separado para atualizar a base local
 
 ## English
@@ -124,20 +124,20 @@ Refresh vendor data:
 - cautious heuristics for randomized private MAC addresses
 - dedicated updater for the local vendor database
 
-## Francais
+## Français
 
 ### Ce que fait le projet
 
-`ipscanner` a ete pense pour le terminal du quotidien. L'idee n'est pas de produire un rapport complique, mais de montrer rapidement quels appareils sont presents sur le reseau local, avec une sortie lisible et utile.
+`ipscanner` a été pensé pour le terminal du quotidien. L'idée n'est pas de produire un rapport compliqué, mais de montrer rapidement quels appareils sont présents sur le réseau local, avec une sortie lisible et utile.
 
-La vraie difference de la version `v0.9.1`, c'est la detection des fabricants. Au lieu de faire confiance uniquement au texte renvoye par `arp-scan`, le projet utilise maintenant une base locale construite a partir des registres officiels de l'IEEE. Le resultat est plus propre, plus stable et plus credible. Quand une adresse MAC privee et aleatoire empeche une identification certaine, l'outil reste prudent et affiche une estimation probable.
+La vraie différence de la version `v0.9.1`, c'est la détection des fabricants. Au lieu de faire confiance uniquement au texte renvoyé par `arp-scan`, le projet utilise maintenant une base locale construite à partir des registres officiels de l'IEEE. Le résultat est plus propre, plus stable et plus crédible. Quand une adresse MAC privée et aléatoire empêche une identification certaine, l'outil reste prudent et affiche une estimation probable.
 
-### Prerequis
+### Prérequis
 
 - Python 3
 - `arp-scan`
 - `avahi-browse`
-- autorisation d'executer `sudo arp-scan`
+- autorisation d'exécuter `sudo arp-scan`
 
 Sur Debian ou Ubuntu :
 
@@ -146,7 +146,7 @@ sudo apt update
 sudo apt install -y python3 arp-scan avahi-utils
 ```
 
-### Demarrage rapide
+### Démarrage rapide
 
 ```bash
 chmod +x ipscanner ipscanner-update-db
@@ -166,7 +166,7 @@ Afficher les informations de la base locale :
 ./ipscanner --db-info
 ```
 
-Mettre a jour la base des fabricants :
+Mettre à jour la base des fabricants :
 
 ```bash
 ./ipscanner-update-db
@@ -174,8 +174,8 @@ Mettre a jour la base des fabricants :
 
 ### Points importants de la v0.9.1
 
-- resolution locale des fabricants a partir des registres officiels IEEE
+- résolution locale des fabricants à partir des registres officiels IEEE
 - prise en charge de MA-L, MA-M et MA-S
 - suppression des doublons issus de `arp-scan`
-- heuristiques prudentes pour les MAC privees aleatoires
-- script dedie pour mettre a jour la base locale
+- heuristiques prudentes pour les MAC privées aléatoires
+- script dédié pour mettre à jour la base locale
