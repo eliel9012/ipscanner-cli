@@ -6,12 +6,16 @@ IEEE OUI database for more reliable manufacturer detection.
 """
 
 import argparse
+import csv as csv_mod
 import json
 import re
+import signal
 import socket
 import subprocess
 import sys
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,10 +31,11 @@ MAGENTA = "\033[95m"
 CYAN = "\033[96m"
 WHITE = "\033[97m"
 
-VERSION = "0.9.1"
+VERSION = "1.0.0"
 DATA_DIR = Path.home() / ".local" / "share" / "ipscanner"
 DB_PATH = DATA_DIR / "vendors.json"
 DB_STALE_DAYS = 45
+API_CACHE_PATH = DATA_DIR / "api_cache.json"
 
 # Friendly device-type guessing based on vendor + services
 DEVICE_ICONS = {
@@ -103,13 +108,35 @@ SERVICE_FRIENDLY = {
 }
 
 
+# ── CLI args ──────────────────────────────────────────────────────────────────
+
 def parse_args():
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--db-info", action="store_true", help="show local vendor DB info and exit")
-    parser.add_argument("--version", action="store_true", help="show version and exit")
-    parser.add_argument("-h", "--help", action="help", help="show this help message and exit")
+    parser = argparse.ArgumentParser(
+        description="ipscanner — LAN device scanner with vendor + Bonjour info",
+        add_help=False,
+    )
+    parser.add_argument("--db-info", action="store_true",
+                        help="show local vendor DB info and exit")
+    parser.add_argument("--version", action="store_true",
+                        help="show version and exit")
+    parser.add_argument("--subnet", metavar="CIDR",
+                        help="subnet to scan (e.g. 192.168.1.0/24); detected automatically if omitted")
+    parser.add_argument("--no-bonjour", action="store_true",
+                        help="skip Bonjour/mDNS service discovery")
+    parser.add_argument("--json", action="store_true",
+                        help="output results as JSON")
+    parser.add_argument("--csv", action="store_true",
+                        help="output results as CSV")
+    parser.add_argument("--timeout", type=int, default=15, metavar="S",
+                        help="arp-scan timeout in seconds (default: 15)")
+    parser.add_argument("--api", action="store_true",
+                        help="query macvendors.com API for unknown MACs (requires internet)")
+    parser.add_argument("-h", "--help", action="help",
+                        help="show this help message and exit")
     return parser.parse_args()
 
+
+# ── Vendor DB ─────────────────────────────────────────────────────────────────
 
 def normalize_mac(mac):
     return re.sub(r"[^0-9A-Fa-f]", "", mac or "").upper()
@@ -132,7 +159,6 @@ def is_locally_administered_mac(mac):
 def load_vendor_db():
     if not DB_PATH.exists():
         return None
-
     try:
         data = json.loads(DB_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -155,11 +181,9 @@ def load_vendor_db():
 def lookup_vendor(mac, vendor_db):
     if not vendor_db:
         return None
-
     normalized = normalize_mac(mac)
     if len(normalized) < 12:
         return None
-
     for prefix_len in (9, 7, 6):
         vendor = vendor_db["prefixes"][prefix_len].get(normalized[:prefix_len])
         if vendor:
@@ -167,39 +191,83 @@ def lookup_vendor(mac, vendor_db):
     return None
 
 
+# ── API fallback (macvendors.com) ─────────────────────────────────────────────
+
+_api_cache: dict = {}
+
+
+def _load_api_cache():
+    global _api_cache
+    if API_CACHE_PATH.exists():
+        try:
+            _api_cache = json.loads(API_CACHE_PATH.read_text())
+        except Exception:
+            _api_cache = {}
+
+
+def _save_api_cache():
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        API_CACHE_PATH.write_text(json.dumps(_api_cache))
+    except Exception:
+        pass
+
+
+def lookup_vendor_api(mac: str) -> str | None:
+    """Query macvendors.com for unknown OUIs, with persistent local cache."""
+    prefix = normalize_mac(mac)[:6]
+    if prefix in _api_cache:
+        return _api_cache[prefix] or None
+
+    try:
+        import urllib.request
+        url = f"https://api.macvendors.com/{mac}"
+        req = urllib.request.Request(url, headers={"User-Agent": f"ipscanner/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            vendor = resp.read().decode().strip()
+            _api_cache[prefix] = vendor
+            return vendor
+    except Exception:
+        _api_cache[prefix] = ""  # negative cache
+        return None
+
+
+def enrich_vendors_via_api(devices: list) -> list:
+    """Fill in missing vendors via macvendors.com API, in parallel."""
+    unknown = [(i, mac) for i, (ip, mac, vendor) in enumerate(devices)
+               if is_unknown_vendor(vendor)]
+    if not unknown:
+        return devices
+
+    def fetch(args):
+        idx, mac = args
+        return idx, lookup_vendor_api(mac)
+
+    devices = list(devices)
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        for idx, vendor in pool.map(fetch, unknown):
+            ip, mac, _ = devices[idx]
+            devices[idx] = (ip, mac, vendor or "Unknown")
+
+    _save_api_cache()
+    return devices
+
+
+# ── Context-based vendor guessing ─────────────────────────────────────────────
+
 def guess_vendor_from_context(hostname, services_list):
     haystack = " ".join(
-        filter(
-            None,
-            [hostname]
-            + [item for service in services_list for item in service[:3]],
-        )
+        filter(None, [hostname] + [item for svc in services_list for item in svc[:3]])
     ).lower()
 
-    apple_markers = [
-        "macbook",
-        "mac mini",
-        "mac-mini",
-        "iphone",
-        "ipad",
-        "imac",
-        "airplay",
-        "raop",
-        "companion-link",
-        "apple-mobdev",
-        "remotepairing",
-    ]
-    if any(marker in haystack for marker in apple_markers):
+    if any(m in haystack for m in ["macbook", "mac mini", "mac-mini", "iphone", "ipad",
+                                    "imac", "airplay", "raop", "companion-link",
+                                    "apple-mobdev", "remotepairing"]):
         return "Apple (provável, MAC privado)"
-
-    google_markers = ["googlecast", "chromecast", "nest"]
-    if any(marker in haystack for marker in google_markers):
+    if any(m in haystack for m in ["googlecast", "chromecast", "nest"]):
         return "Google (provável, MAC privado)"
-
-    amazon_markers = ["amazon fire tv", "fire tv", "alexa", "echo"]
-    if any(marker in haystack for marker in amazon_markers):
+    if any(m in haystack for m in ["amazon fire tv", "fire tv", "alexa", "echo"]):
         return "Amazon (provável, MAC privado)"
-
     return None
 
 
@@ -210,28 +278,27 @@ def resolve_vendor(mac, arp_vendor, vendor_db, hostname, services_list):
     if arp_vendor and not is_unknown_vendor(arp_vendor):
         return arp_vendor.strip()
     if is_locally_administered_mac(mac):
-        guessed_vendor = guess_vendor_from_context(hostname, services_list)
-        if guessed_vendor:
-            return guessed_vendor
+        guessed = guess_vendor_from_context(hostname, services_list)
+        if guessed:
+            return guessed
     if db_vendor:
         return db_vendor
     return arp_vendor.strip() if arp_vendor else "Unknown"
 
 
+# ── Vendor DB status / info ───────────────────────────────────────────────────
+
 def vendor_db_status(vendor_db):
     if not vendor_db:
         return "Fabricantes: fallback do arp-scan (sem base IEEE local)"
-
     generated_at = vendor_db.get("generated_at")
     if not generated_at:
         return "Fabricantes: IEEE local"
-
     try:
         dt = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
         age_days = (datetime.now(timezone.utc) - dt).days
     except ValueError:
         return "Fabricantes: IEEE local"
-
     if age_days > DB_STALE_DAYS:
         return f"Fabricantes: IEEE local ({age_days} dias, rode ipscanner-update-db)"
     return f"Fabricantes: IEEE local ({age_days} dias)"
@@ -243,8 +310,7 @@ def print_db_info(vendor_db):
         print("Status: ausente")
         print("Ação: rode ipscanner-update-db")
         return
-
-    print(f"Status: presente")
+    print("Status: presente")
     print(f"Fonte: {vendor_db.get('source_name', 'IEEE Registration Authority')}")
     print(f"Gerado em: {vendor_db.get('generated_at', '?')}")
     counts = vendor_db.get("counts", {})
@@ -257,41 +323,75 @@ def print_db_info(vendor_db):
     print(vendor_db_status(vendor_db))
 
 
-def get_interface():
-    """Detect the main LAN interface from default route."""
+# ── Network interface + gateway ───────────────────────────────────────────────
+
+def get_interface_and_gateway():
+    """Return (iface, gateway_ip) from the default route."""
+    iface = "eth0"
+    gateway_ip = None
     try:
         out = subprocess.check_output(
             ["ip", "route", "show", "default"], text=True
         )
         for line in out.splitlines():
-            match = re.search(r"dev\s+(\S+)", line)
-            if match and not match.group(1).startswith(("docker", "br-", "veth", "nord", "tun", "wg")):
-                return match.group(1)
+            # "default via 192.168.1.1 dev eth0 ..."
+            m = re.search(r"default via (\S+) dev (\S+)", line)
+            if m:
+                gateway_ip = m.group(1)
+                candidate = m.group(2)
+                if not candidate.startswith(("docker", "br-", "veth", "nord", "tun", "wg")):
+                    iface = candidate
+                break
     except Exception:
         pass
-    return "eth0"
+    return iface, gateway_ip
 
 
-def run_arp_scan(iface):
+def get_my_ip(iface):
+    try:
+        out = subprocess.check_output(["ip", "-4", "addr", "show", iface], text=True)
+        m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", out)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def get_my_mac(iface):
+    try:
+        out = subprocess.check_output(["ip", "link", "show", iface], text=True)
+        m = re.search(r"link/ether\s+([0-9a-fA-F:]{17})", out)
+        if m:
+            return m.group(1).lower()
+    except Exception:
+        pass
+    return "??:??:??:??:??:??"
+
+
+# ── ARP scan ──────────────────────────────────────────────────────────────────
+
+def run_arp_scan(iface, subnet=None, timeout=15):
     """Run arp-scan and return list of (ip, mac, vendor)."""
     devices = []
     seen = set()
+    cmd = ["sudo", "arp-scan", f"--interface={iface}", f"--retry=2",
+           f"--timeout={timeout * 1000}"]
+    if subnet:
+        cmd.append(subnet)
+    else:
+        cmd.append("--localnet")
+
     try:
         out = subprocess.check_output(
-            ["sudo", "arp-scan", "--localnet", f"--interface={iface}", "--retry=2"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-            timeout=15,
+            cmd, text=True, stderr=subprocess.DEVNULL, timeout=timeout + 5
         )
         for line in out.splitlines():
-            match = re.match(
-                r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:]{17})\s+(.*)",
-                line.strip(),
-            )
-            if match:
-                ip = match.group(1)
-                mac = match.group(2).lower()
-                vendor = match.group(3).strip()
+            m = re.match(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:]{17})\s+(.*)", line.strip())
+            if m:
+                ip = m.group(1)
+                mac = m.group(2).lower()
+                vendor = m.group(3).strip()
                 key = (ip, mac)
                 if key not in seen:
                     seen.add(key)
@@ -301,8 +401,10 @@ def run_arp_scan(iface):
     return devices
 
 
+# ── Bonjour / mDNS ───────────────────────────────────────────────────────────
+
 def run_avahi_browse():
-    """Run avahi-browse and return dict: ip -> list of (service_name, service_type, hostname, port)."""
+    """Run avahi-browse and return dict: ip -> [(name, type, hostname, port)]."""
     services = defaultdict(list)
     try:
         raw = subprocess.check_output(
@@ -333,16 +435,28 @@ def run_avahi_browse():
     return services
 
 
-def resolve_hostname(ip):
-    """Try reverse DNS lookup."""
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except (socket.herror, socket.gaierror, OSError):
-        return None
+# ── Parallel DNS resolution ───────────────────────────────────────────────────
 
+def resolve_hostnames_parallel(ips: list) -> dict:
+    """Resolve multiple IPs to hostnames concurrently."""
+    results = {}
+
+    def resolve_one(ip):
+        try:
+            return ip, socket.gethostbyaddr(ip)[0]
+        except (socket.herror, socket.gaierror, OSError):
+            return ip, None
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        for ip, hostname in pool.map(resolve_one, ips):
+            results[ip] = hostname
+
+    return results
+
+
+# ── Display helpers ───────────────────────────────────────────────────────────
 
 def get_device_icon(vendor, services_list):
-    """Pick an emoji icon based on vendor name or services."""
     vendor_lower = vendor.lower()
     for key, icon in DEVICE_ICONS.items():
         if key in vendor_lower:
@@ -361,7 +475,6 @@ def get_device_icon(vendor, services_list):
 
 
 def friendly_service(svc_type):
-    """Convert service type to a friendly label."""
     svc_key = svc_type.strip().rstrip(".")
     if svc_key in SERVICE_FRIENDLY:
         return SERVICE_FRIENDLY[svc_key]
@@ -377,11 +490,14 @@ def print_header():
     print()
 
 
-def print_device(ip, mac, vendor, hostname, services_list, is_self):
+def print_device(ip, mac, vendor, hostname, services_list, is_self, is_gateway):
     icon = get_device_icon(vendor, services_list)
 
     if is_self:
         label = f"{GREEN}{BOLD}★ ESTE DISPOSITIVO{RESET}"
+    elif is_gateway:
+        gw_vendor = f"  {YELLOW}{vendor}{RESET}" if vendor and "unknown" not in vendor.lower() else ""
+        label = f"{YELLOW}{BOLD}⬆ GATEWAY{RESET}{gw_vendor}"
     elif "unknown" in vendor.lower():
         label = f"{DIM}{vendor}{RESET}"
     else:
@@ -420,8 +536,49 @@ def print_device(ip, mac, vendor, hostname, services_list, is_self):
             print(f"      {DIM}Serviços:{RESET} {', '.join(svc_labels)}")
 
 
+# ── Output formatters ─────────────────────────────────────────────────────────
+
+def output_json(resolved_devices, avahi_services, my_ip, gateway_ip):
+    out = []
+    for ip, mac, vendor, hostname, services in resolved_devices:
+        out.append({
+            "ip": ip,
+            "mac": mac,
+            "vendor": vendor,
+            "hostname": hostname,
+            "is_self": ip == my_ip,
+            "is_gateway": ip == gateway_ip,
+            "randomly_assigned_mac": is_locally_administered_mac(mac),
+            "services": [
+                {"name": s[0], "type": s[1], "host": s[2], "port": s[3]}
+                for s in services
+            ],
+        })
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+
+def output_csv(resolved_devices, my_ip, gateway_ip):
+    writer = csv_mod.writer(sys.stdout)
+    writer.writerow(["ip", "mac", "vendor", "hostname", "is_self", "is_gateway", "services"])
+    for ip, mac, vendor, hostname, services in resolved_devices:
+        svcs = "|".join(f"{s[1]}:{s[3]}" for s in services)
+        writer.writerow([ip, mac, vendor, hostname or "", ip == my_ip, ip == gateway_ip, svcs])
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     args = parse_args()
+    quiet = args.json or args.csv
+
+    def _handle_exit(sig, frame):
+        if not quiet:
+            print(f"\n\n  {YELLOW}Interrompido pelo usuário.{RESET}\n")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _handle_exit)
+    signal.signal(signal.SIGTERM, _handle_exit)
+
     vendor_db = load_vendor_db()
 
     if args.db_info:
@@ -431,50 +588,51 @@ def main():
         print(VERSION)
         return
 
-    print_header()
+    if args.api:
+        _load_api_cache()
 
-    iface = get_interface()
-    my_ip = None
-    try:
-        out = subprocess.check_output(
-            ["ip", "-4", "addr", "show", iface], text=True
-        )
-        match = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", out)
-        if match:
-            my_ip = match.group(1)
-    except Exception:
-        pass
+    if not quiet:
+        print_header()
 
-    print(f"  {DIM}Interface: {iface}  |  Meu IP: {my_ip or '?'}{RESET}")
-    print(f"  {DIM}{vendor_db_status(vendor_db)}{RESET}")
-    print(f"  {DIM}Escaneando...{RESET}", end="", flush=True)
+    iface, gateway_ip = get_interface_and_gateway()
+    my_ip = get_my_ip(iface)
 
-    devices = run_arp_scan(iface)
+    if not quiet:
+        gw_str = f"  |  Gateway: {gateway_ip}" if gateway_ip else ""
+        print(f"  {DIM}Interface: {iface}  |  Meu IP: {my_ip or '?'}{gw_str}{RESET}")
+        print(f"  {DIM}{vendor_db_status(vendor_db)}{RESET}")
+        print(f"  {DIM}Escaneando...{RESET}", end="", flush=True)
+
+    devices = run_arp_scan(iface, subnet=args.subnet, timeout=args.timeout)
 
     if my_ip:
-        found_ips = {device[0] for device in devices}
+        found_ips = {d[0] for d in devices}
         if my_ip not in found_ips:
-            my_mac = "??:??:??:??:??:??"
-            try:
-                mac_out = subprocess.check_output(
-                    ["ip", "link", "show", iface], text=True
-                )
-                match = re.search(r"link/ether\s+([0-9a-fA-F:]{17})", mac_out)
-                if match:
-                    my_mac = match.group(1).lower()
-            except Exception:
-                pass
-            devices.append((my_ip, my_mac, "Este dispositivo"))
+            devices.append((my_ip, get_my_mac(iface), "Este dispositivo"))
 
-    print(f"\r  {DIM}Buscando serviços Bonjour/mDNS...{RESET}  ", end="", flush=True)
-    avahi_services = run_avahi_browse()
+    if args.api:
+        if not quiet:
+            print(f"\r  {DIM}Consultando API para MACs desconhecidos...{RESET}  ", end="", flush=True)
+        devices = enrich_vendors_via_api(devices)
 
-    print(f"\r  {GREEN}{BOLD}{len(devices)}{RESET}{DIM} dispositivos encontrados{RESET}          ")
+    avahi_services: dict = {}
+    if not args.no_bonjour:
+        if not quiet:
+            print(f"\r  {DIM}Buscando serviços Bonjour/mDNS...{RESET}  ", end="", flush=True)
+        avahi_services = run_avahi_browse()
 
+    if not quiet:
+        print(f"\r  {GREEN}{BOLD}{len(devices)}{RESET}{DIM} dispositivos encontrados{RESET}          ")
+
+    # Resolve all hostnames in parallel before printing
+    all_ips = [d[0] for d in devices]
+    hostnames = resolve_hostnames_parallel(all_ips)
+
+    # Sort: gateway first (real IP, not assumed .1), then self, then by IP
     def sort_key(device):
         ip = device[0]
         parts = list(map(int, ip.split(".")))
-        if parts[-1] == 1:
+        if ip == gateway_ip:
             return (0,) + tuple(parts)
         if ip == my_ip:
             return (1,) + tuple(parts)
@@ -482,20 +640,31 @@ def main():
 
     devices.sort(key=sort_key)
 
+    # Build resolved device list
     resolved_devices = []
     for ip, mac, arp_vendor in devices:
-        hostname = resolve_hostname(ip)
+        hostname = hostnames.get(ip)
         services = avahi_services.get(ip, [])
         vendor = resolve_vendor(mac, arp_vendor, vendor_db, hostname, services)
-        is_self = ip == my_ip
-        print_device(ip, mac, vendor, hostname, services, is_self)
-        resolved_devices.append((ip, mac, vendor))
+        resolved_devices.append((ip, mac, vendor, hostname, services))
+
+    if args.json:
+        output_json(resolved_devices, avahi_services, my_ip, gateway_ip)
+        return
+
+    if args.csv:
+        output_csv(resolved_devices, my_ip, gateway_ip)
+        return
+
+    for ip, mac, vendor, hostname, services in resolved_devices:
+        print_device(ip, mac, vendor, hostname, services,
+                     is_self=ip == my_ip, is_gateway=ip == gateway_ip)
 
     print(f"  {CYAN}{'─' * 66}{RESET}")
     print()
 
     vendors = defaultdict(int)
-    for _, _, vendor in resolved_devices:
+    for _, _, vendor, _, _ in resolved_devices:
         key = vendor if "unknown" not in vendor.lower() else "Desconhecido"
         vendors[key] += 1
 
